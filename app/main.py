@@ -8,8 +8,9 @@ import logging
 import re
 from sqlalchemy import text
 import getpass
-from langchain.chat_models import init_chat_model
-
+from langchain.chat_models import init_chat_model  # Correct import
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 load_dotenv()
 
@@ -21,12 +22,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY environment variable is not set.")
 
-# os.environ["GROQ_API_KEY"] = getpass.getpass(GROQ_API_KEY)
-
-
-# GROQ_MODEL = os.getenv("GROQ_MODEL")
 GROQ_MODEL = "llama-3.1-8b-instant"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"  # Adjust if different
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 def get_db():
@@ -37,16 +34,34 @@ def get_db():
         db.close()
 
 
-from pydantic import BaseModel, Field
-
-
-class SQLQueryExtractor(BaseModel):
+class FetchData(BaseModel):
     """Extracts an SQL query from natural language input."""
 
     query: str = Field(..., description="The generated SQL query.")
 
 
+system_prompt = """
+
+You are a helpful assistant designed to answer user questions by querying a database.  You have access to a tool called `FetchData`, to fetch data from the SQL database.
+
+The database contains a single table named `customers`, defined as:
+>  CREATE  TABLE customers (
+>     customer_id INTEGER  PRIMARY KEY,
+>     name VARCHAR,
+>     gender VARCHAR,
+>     location VARCHAR );
+
+When filtering or comparing values in the `gender` or `location` columns, use `LOWER()` to ensure case-insensitive matching.
+
+Your job is to:
+1.  Understand the user's question.
+2.  If the answer requires querying the database, use the `FetchDAta` tool to extract relevant data from database.
+3.  Use the result of the query to answer the user's question in a clear and helpful way.
+4.  Final answer should be in the form of a natural language response, not SQL code. do not include the tool usage in the final answers."""
+
+
 async def get_sql_from_llm(prompt: str) -> str:
+    """Fallback method using direct API call."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -57,12 +72,7 @@ async def get_sql_from_llm(prompt: str) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a helpful assistant that converts natural language to SQL. "
-                    "Use the table 'customers'. It was created with: "
-                    "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name VARCHAR, gender VARCHAR, location VARCHAR); "
-                    "Always compare values of 'gender' and 'location' using LOWER() for case-insensitive matching."
-                ),
+                "content": system_prompt,
             },
             {"role": "user", "content": prompt},
         ],
@@ -83,47 +93,69 @@ async def query(request: Request):
         raise HTTPException(status_code=400, detail="Query is required")
 
     try:
-        # Step 1: Get SQL from LLM
-        llm_response = await get_sql_from_llm(natural_query)
+        # Initialize the chat model - correct model name for Groq
+        llm = init_chat_model("llama3-8b-8192", model_provider="groq")
 
-        # llm = init_chat_model("llama3-8b-8192", model_provider="groq")
-        # llm_with_tools = llm.bind_tools([SQLQueryExtractor])
+        # Bind the SQLQueryExtractor tool
+        llm_with_tools = llm.bind_tools([FetchData])
 
-        # ai_msg = llm_with_tools.invoke(natural_query)
-        # response = ai_msg.tool_calls
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=natural_query),
+        ]
+        for i in range(3):
+            ai_msg = llm_with_tools.invoke(messages)
+            if ai_msg.tool_calls:
+                for tool_call in ai_msg.tool_calls:
+                    if tool_call["name"] == "FetchData":
+                        sql_query = tool_call["args"].get("query")
+                        data = await get_sql_from_llm(sql_query)
+                        messages.append(
+                            ToolMessage(
+                                tool_call_id=tool_call["id"],
+                                content=data,
+                            )
+                        )
+            else:
+                # logging.info("No tool calls found, retrying...", ai_msg.content)
+                print(f"No tool calls found, retrying... {ai_msg.content}")
+                print(f"AI Message: {ai_msg}")
+                return {"result": ai_msg.content}
 
-        # logging.info(f"AI Message: {ai_msg}")
+        logging.info(f"AI Message type: {type(ai_msg)}")
+        logging.info(
+            f"AI Message content: {ai_msg.content if hasattr(ai_msg, 'content') else 'No content'}"
+        )
+        logging.info(
+            f"AI Message tool_calls: {ai_msg.tool_calls if hasattr(ai_msg, 'tool_calls') else 'No tool_calls'}"
+        )
 
-        # if ai_msg.tool_calls:
-        #     logging.info(f"Tool Calls: {ai_msg.tool_calls}")
-        #     tool_call = ai_msg.tool_calls[0]
-        #     if tool_call['name'] == 'SQLQueryExtractor':
-        #         response = tool_call["args"].get("query", None)
-        #         llm_response = await get_sql_from_llm(natural_query)
+        if not sql_query:
+            logging.warning("No valid SQL from tool call, using fallback method")
+            if tool_error_details:
+                logging.info(f"Tool error was: {tool_error_details}")
+            return ai_msg.content
 
-        # else:
-        #     logging.warning("No tool calls found in AI message.")
-        #     return ai_msg.content
-
-        logging.info(f"Raw LLM Response:\n{llm_response}")
-
-        # Step 2: Extract actual SQL from markdown
-        sql_match = re.search(r"```sql\n(.*?)```", llm_response, re.DOTALL)
-        if sql_match:
-            sql_query = sql_match.group(1).strip()
-        else:
-            sql_query = llm_response.strip()
-
-        logging.info(f"Extracted SQL: {sql_query}")
-
-        # Step 3: Execute SQL safely
         db: Session = next(get_db())
         result = db.execute(text(sql_query)).fetchall()
         logging.info(f"Query executed successfully, fetched {len(result)} rows.")
         logging.debug(f"Query Result: {result}")
 
         return {"results": [dict(row._mapping) for row in result]}
+    except Exception as tool_error:
+        tool_error_details = str(tool_error)
+        logging.error(f"Tool calling failed with error: {tool_error}")
+        logging.error(f"Tool error type: {type(tool_error)}")
+        import traceback
 
-    except Exception as e:
-        logging.exception("Error processing query")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+
+
+@app.get("/")
+async def root():
+    return {"message": "Customer Query API is running"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}

@@ -11,11 +11,20 @@ import getpass
 from langchain.chat_models import init_chat_model  # Correct import
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # React dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
